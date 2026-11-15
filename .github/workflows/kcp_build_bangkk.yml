@@ -1,3 +1,4 @@
+
 name: Build KCP kernel for motorola moto g84 5G
 
 on:
@@ -6,18 +7,24 @@ on:
       localversion:
         description: "Version suffix (CONFIG_LOCALVERSION)"
         default: "-moto-kcp1"
+        type: string
   push:
     tags:
       - "v5.4.302-moto-kcp*"
 
+permissions:
+  contents: read
+
 env:
   ARCH: arm64
   DEFCONFIG: vendor/holi-qgki_defconfig
+
   KERNEL_REPO: kernelcontinuityproject/android_kernel_motorola_sm6375-kcp
   KERNEL_BRANCH: lineage-24.0
-  # AOSP kernel clang (r416183b, the one build.config.common pins), as shipped by LineageOS
+
   CLANG_REPO: https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b
   CLANG_BRANCH: lineage-20.0
+
   ANYKERNEL_REPO: https://github.com/samw662/AnyKernel3
   ANYKERNEL_BRANCH: bangkk
 
@@ -25,6 +32,7 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     timeout-minutes: 360
+
     steps:
       - name: Checkout kernel source
         uses: actions/checkout@v4
@@ -34,150 +42,304 @@ jobs:
           fetch-depth: 1
 
       - name: Check kernel tree
+        shell: bash
         run: |
+          set -euo pipefail
+
           if [ ! -f Makefile ] || ! grep -q '^SUBLEVEL = 302' Makefile; then
-            echo "::error::this is not the 5.4.302 kernel tree"
+            echo "::error::This is not the 5.4.302 kernel tree"
             ls -la
             exit 1
           fi
+
           test -f "arch/arm64/configs/$DEFCONFIG"
 
       - name: Install dependencies
         run: |
           sudo apt-get update
+
           sudo apt-get install -y --no-install-recommends \
-            bc bison flex libssl-dev libelf-dev cpio kmod zip python3 \
-            gcc-aarch64-linux-gnu
+            bc \
+            bison \
+            flex \
+            libssl-dev \
+            libelf-dev \
+            libncurses-dev \
+            cpio \
+            kmod \
+            zip \
+            unzip \
+            python3 \
+            gcc-aarch64-linux-gnu \
+            binutils \
+            file \
+            rsync \
+            lz4 \
+            zstd \
+            device-tree-compiler
 
       - name: Set up AOSP clang
         run: |
-          git clone --depth 1 -b "$CLANG_BRANCH" "$CLANG_REPO" "$HOME/clang"
+          set -euo pipefail
+
+          git clone --depth 1 \
+            -b "$CLANG_BRANCH" \
+            "$CLANG_REPO" \
+            "$HOME/clang"
+
           rm -rf "$HOME/clang/.git"
+
           echo "$HOME/clang/bin" >> "$GITHUB_PATH"
 
       - name: Set build variables
+        shell: bash
         run: |
+          set -euo pipefail
+
           LV="${{ inputs.localversion || '-moto-kcp1' }}"
+
           echo "LV=$LV" >> "$GITHUB_ENV"
+
           echo "MAKE_ARGS=O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu-" >> "$GITHUB_ENV"
 
-
-      - name: Configure (defconfig + localversion)
+      - name: Configure kernel
+        shell: bash
         run: |
+          set -euo pipefail
+
           clang --version | head -1
+
           touch .scmversion
-          make $MAKE_ARGS $DEFCONFIG
 
-          # Set kernel localversion
-          scripts/config --file out/.config --set-str LOCALVERSION "$LV"
-          scripts/config --file out/.config --disable LOCALVERSION_AUTO
+          make $MAKE_ARGS "$DEFCONFIG"
 
-          # Enable Motorola device tree overlays
-          scripts/config --file out/.config --enable BUILD_ARM64_DT_OVERLAY
+          scripts/config --file out/.config \
+            --set-str LOCALVERSION "$LV"
 
-          # Apply configuration changes
+          scripts/config --file out/.config \
+            --disable LOCALVERSION_AUTO
+
+          # Motorola DT overlays
+          scripts/config --file out/.config \
+            --enable BUILD_ARM64_DT_OVERLAY
+
           make $MAKE_ARGS olddefconfig
           make $MAKE_ARGS syncconfig
 
-          # Verify LLVM toolchain
+          # LLVM verification
           grep -q '^CONFIG_CC_IS_CLANG=y' out/.config
           grep -q '^CONFIG_LD_IS_LLD=y' out/.config
 
-          # Verify device tree overlays
-          grep -q '^CONFIG_BUILD_ARM64_DT_OVERLAY=y' out/.config || {
+          # DT overlay verification
+          if ! grep -q '^CONFIG_BUILD_ARM64_DT_OVERLAY=y' out/.config; then
             echo "::error::CONFIG_BUILD_ARM64_DT_OVERLAY is not enabled"
             exit 1
-          }
+          fi
 
           echo "Kernel configuration validated successfully!"
-          
+
       - name: Check kernel release
+        shell: bash
         run: |
+          set -euo pipefail
+
           BASE="$(make -s kernelversion)"
           KREL="$(make -s $MAKE_ARGS kernelrelease)"
-          echo "kernelversion=$BASE  kernelrelease=$KREL"
+
+          echo "kernelversion=$BASE"
+          echo "kernelrelease=$KREL"
+
           if [ "$KREL" != "${BASE}${LV}" ]; then
-            echo "::error::kernelrelease ($KREL) does not match expected (${BASE}${LV})"
+            echo "::error::Unexpected kernel release: $KREL"
             exit 1
           fi
+
           echo "KREL=$KREL" >> "$GITHUB_ENV"
 
-      - name: Build kernel, dtbs and modules
-        run: make -j"$(nproc)" $MAKE_ARGS Image dtbs modules
+      - name: Build kernel, DTBs and modules
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          make -j"$(nproc)" $MAKE_ARGS \
+            Image dtbs modules 2>&1 | tee build.log
 
       - name: Install modules
+        shell: bash
         run: |
-          make $MAKE_ARGS INSTALL_MOD_PATH="$PWD/modules_out" INSTALL_MOD_STRIP=1 modules_install
-          find modules_out -name '*.ko' | wc -l
+          set -euo pipefail
 
+          rm -rf modules_out
 
-      - name: Diagnose module vermagic
-        run: |
-          echo "Expected vermagic:"
-          cat out/include/config/kernel.release
+          # Do not strip modules before checking their metadata.
+          make $MAKE_ARGS \
+            INSTALL_MOD_PATH="$PWD/modules_out" \
+            modules_install
 
-          for f in \
-            modules_out/lib/modules/*/kernel/lib/lzo/lzo_decompress.ko \
-            modules_out/lib/modules/*/kernel/lib/lzo/lzo_compress.ko \
-            modules_out/lib/modules/*/kernel/crypto/lzo.ko \
-            modules_out/lib/modules/*/kernel/crypto/lzo-rle.ko
-          do
-            echo ""
-            echo "===== $f ====="
-            ls -l "$f"
-            file "$f"
-            modinfo -F vermagic "$f" || true
-            readelf -S "$f" | grep -E 'modinfo|this_module'
-            readelf -p .modinfo "$f" || true
-          done
-          
+          MODULE_COUNT="$(find modules_out -type f -name '*.ko' | wc -l)"
+
+          echo "Installed modules: $MODULE_COUNT"
+
+          if [ "$MODULE_COUNT" -eq 0 ]; then
+            echo "::error::No kernel modules were installed"
+            exit 1
+          fi
+
       - name: Verify module vermagic
+        shell: bash
         run: |
+          set -euo pipefail
+
           EXPECT="$(cat out/include/config/kernel.release)"
-          bad=0; total=0
-          while IFS= read -r ko; do
-            total=$((total+1))
-            vm="$(modinfo -F vermagic "$ko")"
-            case "$vm" in
-              "$EXPECT "*) ;;
-              *) echo "wrong vermagic: $ko -> $vm"; bad=$((bad+1)) ;;
+
+          BAD=0
+          TOTAL=0
+
+          echo "Expected vermagic: $EXPECT"
+
+          while IFS= read -r -d '' KO; do
+            TOTAL=$((TOTAL + 1))
+
+            # Read vermagic directly from the ELF .modinfo section.
+            VM="$(
+              readelf -p .modinfo "$KO" 2>/dev/null |
+              sed -n 's/.*vermagic=//p' |
+              head -n 1 |
+              sed 's/[[:space:]]*$//'
+            )"
+
+            case "$VM" in
+              "$EXPECT" | "$EXPECT "*)
+                ;;
+              *)
+                echo "wrong vermagic: $KO -> $VM"
+                BAD=$((BAD + 1))
+                ;;
             esac
-          done < <(find modules_out -name '*.ko')
-          echo "modules: $total, wrong: $bad (expected: $EXPECT ...)"
-          [ "$total" -gt 0 ] && [ "$bad" -eq 0 ]
+
+          done < <(find modules_out -type f -name '*.ko' -print0)
+
+          echo "modules: $TOTAL, wrong: $BAD (expected: $EXPECT ...)"
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "::error::No modules found"
+            exit 1
+          fi
+
+          if [ "$BAD" -ne 0 ]; then
+            echo "::error::$BAD modules have incorrect vermagic"
+            exit 1
+          fi
+
+          echo "All modules have valid vermagic!"
+
+      - name: Archive modules
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -d modules_out/lib ]; then
+            tar -C modules_out \
+              -czf "modules-${KREL}.tar.gz" lib
+
+            echo "Modules archived successfully"
+          else
+            echo "::warning::modules_out/lib does not exist"
+          fi
+
+      - name: Upload modules
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kcp-modules-${{ env.KREL }}
+          path: modules-${{ env.KREL }}.tar.gz
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kcp-build-diagnostics
+          path: |
+            build.log
+            out/.config
+            out/include/config/kernel.release
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Package with AnyKernel3
+        shell: bash
         run: |
-          git clone --depth 1 -b "$ANYKERNEL_BRANCH" "$ANYKERNEL_REPO" ak3
-          cp out/arch/arm64/boot/Image ak3/Image
+          set -euo pipefail
 
-          # dtbs: concatenate the generated .dtb files (filter for the device if needed)
-          find out/arch/arm64/boot/dts/vendor/qcom -name '*.dtb' | sort | xargs -r cat > ak3/dtb
+          # Verify kernel image
+          IMAGE="out/arch/arm64/boot/Image"
 
-          # modules: use the AnyKernel3 branch's own place-modules.sh
+          if [ ! -s "$IMAGE" ]; then
+            echo "::error::Kernel Image not found"
+            exit 1
+          fi
+
+          git clone --depth 1 \
+            -b "$ANYKERNEL_BRANCH" \
+            "$ANYKERNEL_REPO" ak3
+
+          cp "$IMAGE" ak3/Image
+
+          # Collect DTBs
+          DTB_DIR="out/arch/arm64/boot/dts/vendor/qcom"
+
+          if [ ! -d "$DTB_DIR" ]; then
+            echo "::error::DTB directory not found"
+            exit 1
+          fi
+
+          mapfile -t DTBS < <(
+            find "$DTB_DIR" -type f -name '*.dtb' | sort
+          )
+
+          if [ "${#DTBS[@]}" -eq 0 ]; then
+            echo "::error::No DTBs found"
+            exit 1
+          fi
+
+          cat "${DTBS[@]}" > ak3/dtb
+
+          echo "DTBs packaged: ${#DTBS[@]}"
+
+          # Install modules
           cd ak3
+
+          if [ ! -f place-modules.sh ]; then
+            echo "::error::place-modules.sh not found"
+            exit 1
+          fi
+
           chmod +x place-modules.sh
-          ./place-modules.sh "../modules_out/lib/modules/$KREL" modules/vendor/lib/modules /vendor/lib/modules
+
+          ./place-modules.sh \
+            "../modules_out/lib/modules/$KREL" \
+            modules/vendor/lib/modules \
+            /vendor/lib/modules
 
           ZIP="KCP-${KREL}-$(date +%Y%m%d).zip"
-          zip -r9 "../$ZIP" . -x '.git*' 'README.md' '*placeholder'
+
+          zip -r9 "../$ZIP" . \
+            -x '.git*' \
+            'README.md' \
+            '*placeholder'
+
           echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+
+          echo "Package created: $ZIP"
 
       - name: Upload flashable zip
         uses: actions/upload-artifact@v4
         with:
           name: kcp-${{ env.KREL }}
-          path: |
-            ${{ env.ZIP }}
-            out/arch/arm64/boot/Image
-            out/.config
+          path: ${{ env.ZIP }}
           if-no-files-found: error
-
-      - name: Pack modules
-        run: tar -C modules_out -czf "modules-${KREL}.tar.gz" lib
-
-      - name: Upload modules
-        uses: actions/upload-artifact@v4
-        with:
-          name: kcp-modules-${{ env.KREL }}
-          path: modules-${{ env.KREL }}.tar.gz
+          retention-days: 14
+          
