@@ -5,10 +5,10 @@ on:
     inputs:
       localversion:
         description: "Version suffix (CONFIG_LOCALVERSION)"
-        default: "-kcp1"
+        default: "-moto-kcp1"
   push:
     tags:
-      - "v5.4.302-kcp*"
+      - "v5.4.302-moto-kcp*"
 
 env:
   ARCH: arm64
@@ -57,7 +57,7 @@ jobs:
 
       - name: Set build variables
         run: |
-          LV="${{ inputs.localversion || '-kcp1' }}"
+          LV="${{ inputs.localversion || '-moto-kcp1' }}"
           echo "LV=$LV" >> "$GITHUB_ENV"
           echo "MAKE_ARGS=O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu-" >> "$GITHUB_ENV"
 
