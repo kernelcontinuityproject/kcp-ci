@@ -1,10 +1,10 @@
-name: build kcp
+name: Build KCP kernel for motorola moto g84 5G
 
 on:
   workflow_dispatch:
     inputs:
       localversion:
-        description: "sufixo da versão (CONFIG_LOCALVERSION)"
+        description: "Version suffix (CONFIG_LOCALVERSION)"
         default: "-kcp1"
   push:
     tags:
@@ -21,12 +21,12 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 360
     steps:
-      - name: checkout
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: dependências
+      - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -34,10 +34,10 @@ jobs:
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
             clang-14 lld-14 llvm-14
 
-      - name: toolchain
+      - name: Set up toolchain
         run: |
-          # o build.config.common do repo usa o clang-r416183b (AOSP). se quiser
-          # o mesmo, defina a variável CLANG_URL (tar.gz com bin/clang na raiz).
+          # build.config.common pins AOSP clang-r416183b. To use the same one,
+          # set the CLANG_URL repo variable (tar.gz with bin/clang at the root).
           if [ -n "${{ vars.CLANG_URL }}" ]; then
             mkdir -p "$HOME/clang"
             curl -fsSL "${{ vars.CLANG_URL }}" | tar -xz -C "$HOME/clang"
@@ -46,40 +46,40 @@ jobs:
             echo "/usr/lib/llvm-14/bin" >> "$GITHUB_PATH"
           fi
 
-      - name: variáveis de build
+      - name: Set build variables
         run: |
           LV="${{ inputs.localversion || '-kcp1' }}"
           echo "LV=$LV" >> "$GITHUB_ENV"
           echo "MAKE_ARGS=O=out ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CROSS_COMPILE_ARM32=arm-linux-gnueabi-" >> "$GITHUB_ENV"
 
-      - name: defconfig + localversion
+      - name: Configure (defconfig + localversion)
         run: |
           clang --version | head -1
-          touch .scmversion   # impede sufixo -dirty / hash do git
+          touch .scmversion   # avoid -dirty / git hash suffix
           make $MAKE_ARGS $DEFCONFIG
           scripts/config --file out/.config --set-str LOCALVERSION "$LV" -d LOCALVERSION_AUTO
           make $MAKE_ARGS olddefconfig
 
-      - name: confere a versão
+      - name: Check kernel release
         run: |
           BASE="$(make -s kernelversion)"
           KREL="$(make -s $MAKE_ARGS kernelrelease)"
           echo "kernelversion=$BASE  kernelrelease=$KREL"
           if [ "$KREL" != "${BASE}${LV}" ]; then
-            echo "::error::kernelrelease ($KREL) diferente do esperado (${BASE}${LV})"
+            echo "::error::kernelrelease ($KREL) does not match expected (${BASE}${LV})"
             exit 1
           fi
           echo "KREL=$KREL" >> "$GITHUB_ENV"
 
-      - name: compila kernel, dtbs e módulos
+      - name: Build kernel, dtbs and modules
         run: make -j"$(nproc)" $MAKE_ARGS Image dtbs modules
 
-      - name: instala módulos
+      - name: Install modules
         run: |
           make $MAKE_ARGS INSTALL_MOD_PATH="$PWD/modules_out" INSTALL_MOD_STRIP=1 modules_install
           find modules_out -name '*.ko' | wc -l
 
-      - name: valida vermagic dos módulos
+      - name: Verify module vermagic
         run: |
           EXPECT="$(cat out/include/config/kernel.release)"
           bad=0; total=0
@@ -88,21 +88,21 @@ jobs:
             vm="$(modinfo -F vermagic "$ko")"
             case "$vm" in
               "$EXPECT "*) ;;
-              *) echo "vermagic errado: $ko -> $vm"; bad=$((bad+1)) ;;
+              *) echo "wrong vermagic: $ko -> $vm"; bad=$((bad+1)) ;;
             esac
           done < <(find modules_out -name '*.ko')
-          echo "módulos: $total, errados: $bad (esperado: $EXPECT ...)"
+          echo "modules: $total, wrong: $bad (expected: $EXPECT ...)"
           [ "$total" -gt 0 ] && [ "$bad" -eq 0 ]
 
-      - name: empacota com anykernel3
+      - name: Package with AnyKernel3
         run: |
           git clone --depth 1 -b "$ANYKERNEL_BRANCH" "$ANYKERNEL_REPO" ak3
           cp out/arch/arm64/boot/Image ak3/Image
 
-          # dtbs: concatena os .dtb gerados (filtre pro seu aparelho se precisar)
+          # dtbs: concatenate the generated .dtb files (filter for the device if needed)
           find out/arch/arm64/boot/dts/vendor/qcom -name '*.dtb' | sort | xargs -r cat > ak3/dtb
 
-          # módulos: usa o place-modules.sh do próprio AnyKernel3 (branch bangkk)
+          # modules: use the AnyKernel3 branch's own place-modules.sh
           cd ak3
           chmod +x place-modules.sh
           ./place-modules.sh "../modules_out/lib/modules/$KREL" modules/vendor/lib/modules /vendor/lib/modules
@@ -111,7 +111,7 @@ jobs:
           zip -r9 "../$ZIP" . -x '.git*' 'README.md' '*placeholder'
           echo "ZIP=$ZIP" >> "$GITHUB_ENV"
 
-      - name: artefatos
+      - name: Upload flashable zip
         uses: actions/upload-artifact@v4
         with:
           name: kcp-${{ env.KREL }}
@@ -121,10 +121,10 @@ jobs:
             out/.config
           if-no-files-found: error
 
-      - name: módulos (tar)
+      - name: Pack modules
         run: tar -C modules_out -czf "modules-${KREL}.tar.gz" lib
 
-      - name: artefato dos módulos
+      - name: Upload modules
         uses: actions/upload-artifact@v4
         with:
           name: kcp-modules-${{ env.KREL }}
