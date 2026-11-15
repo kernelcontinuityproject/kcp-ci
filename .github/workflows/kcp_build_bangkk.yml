@@ -61,18 +61,36 @@ jobs:
           echo "LV=$LV" >> "$GITHUB_ENV"
           echo "MAKE_ARGS=O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu-" >> "$GITHUB_ENV"
 
+
       - name: Configure (defconfig + localversion)
         run: |
           clang --version | head -1
-          touch .scmversion   # avoid the trailing "+" / -dirty / git hash
+          touch .scmversion
           make $MAKE_ARGS $DEFCONFIG
-          scripts/config --file out/.config --set-str LOCALVERSION "$LV" -d LOCALVERSION_AUTO
+
+          # Set kernel localversion
+          scripts/config --file out/.config --set-str LOCALVERSION "$LV"
+          scripts/config --file out/.config --disable LOCALVERSION_AUTO
+
+          # Enable Motorola device tree overlays
+          scripts/config --file out/.config --enable BUILD_ARM64_DT_OVERLAY
+
+          # Apply configuration changes
           make $MAKE_ARGS olddefconfig
-          make $MAKE_ARGS syncconfig   # refresh auto.conf, which setlocalversion reads
-          # force the LLVM toolchain: fail if the config did not pick clang + lld
+          make $MAKE_ARGS syncconfig
+
+          # Verify LLVM toolchain
           grep -q '^CONFIG_CC_IS_CLANG=y' out/.config
           grep -q '^CONFIG_LD_IS_LLD=y' out/.config
 
+          # Verify device tree overlays
+          grep -q '^CONFIG_BUILD_ARM64_DT_OVERLAY=y' out/.config || {
+            echo "::error::CONFIG_BUILD_ARM64_DT_OVERLAY is not enabled"
+            exit 1
+          }
+
+          echo "Kernel configuration validated successfully!"
+          
       - name: Check kernel release
         run: |
           BASE="$(make -s kernelversion)"
