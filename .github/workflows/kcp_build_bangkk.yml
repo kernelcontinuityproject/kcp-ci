@@ -13,6 +13,11 @@ on:
 env:
   ARCH: arm64
   DEFCONFIG: vendor/holi-qgki_defconfig
+  KERNEL_REPO: kernelcontinuityproject/android_kernel_motorola_sm6375-kcp
+  KERNEL_BRANCH: lineage-24.0
+  # AOSP kernel clang (r416183b, the one build.config.common pins), as shipped by LineageOS
+  CLANG_REPO: https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b
+  CLANG_BRANCH: lineage-20.0
   ANYKERNEL_REPO: https://github.com/samw662/AnyKernel3
   ANYKERNEL_BRANCH: bangkk
 
@@ -21,44 +26,52 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 360
     steps:
-      - name: Checkout
+      - name: Checkout kernel source
         uses: actions/checkout@v4
         with:
+          repository: ${{ env.KERNEL_REPO }}
+          ref: ${{ github.event_name == 'push' && github.ref_name || env.KERNEL_BRANCH }}
           fetch-depth: 1
+
+      - name: Check kernel tree
+        run: |
+          if [ ! -f Makefile ] || ! grep -q '^SUBLEVEL = 302' Makefile; then
+            echo "::error::this is not the 5.4.302 kernel tree"
+            ls -la
+            exit 1
+          fi
+          test -f "arch/arm64/configs/$DEFCONFIG"
 
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             bc bison flex libssl-dev libelf-dev cpio kmod zip python3 \
-            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
-            clang-14 lld-14 llvm-14
+            gcc-aarch64-linux-gnu
 
-      - name: Set up toolchain
+      - name: Set up AOSP clang
         run: |
-          # build.config.common pins AOSP clang-r416183b. To use the same one,
-          # set the CLANG_URL repo variable (tar.gz with bin/clang at the root).
-          if [ -n "${{ vars.CLANG_URL }}" ]; then
-            mkdir -p "$HOME/clang"
-            curl -fsSL "${{ vars.CLANG_URL }}" | tar -xz -C "$HOME/clang"
-            echo "$HOME/clang/bin" >> "$GITHUB_PATH"
-          else
-            echo "/usr/lib/llvm-14/bin" >> "$GITHUB_PATH"
-          fi
+          git clone --depth 1 -b "$CLANG_BRANCH" "$CLANG_REPO" "$HOME/clang"
+          rm -rf "$HOME/clang/.git"
+          echo "$HOME/clang/bin" >> "$GITHUB_PATH"
 
       - name: Set build variables
         run: |
           LV="${{ inputs.localversion || '-kcp1' }}"
           echo "LV=$LV" >> "$GITHUB_ENV"
-          echo "MAKE_ARGS=O=out ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CROSS_COMPILE_ARM32=arm-linux-gnueabi-" >> "$GITHUB_ENV"
+          echo "MAKE_ARGS=O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu-" >> "$GITHUB_ENV"
 
       - name: Configure (defconfig + localversion)
         run: |
           clang --version | head -1
-          touch .scmversion   # avoid -dirty / git hash suffix
+          touch .scmversion   # avoid the trailing "+" / -dirty / git hash
           make $MAKE_ARGS $DEFCONFIG
           scripts/config --file out/.config --set-str LOCALVERSION "$LV" -d LOCALVERSION_AUTO
           make $MAKE_ARGS olddefconfig
+          make $MAKE_ARGS syncconfig   # refresh auto.conf, which setlocalversion reads
+          # force the LLVM toolchain: fail if the config did not pick clang + lld
+          grep -q '^CONFIG_CC_IS_CLANG=y' out/.config
+          grep -q '^CONFIG_LD_IS_LLD=y' out/.config
 
       - name: Check kernel release
         run: |
