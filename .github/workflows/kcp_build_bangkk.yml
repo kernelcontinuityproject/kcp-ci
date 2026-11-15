@@ -48,37 +48,23 @@ jobs:
 
           if [ ! -f Makefile ] || ! grep -q '^SUBLEVEL = 302' Makefile; then
             echo "::error::This is not the 5.4.302 kernel tree"
-            ls -la
             exit 1
           fi
 
           test -f "arch/arm64/configs/$DEFCONFIG"
 
       - name: Install dependencies
+        shell: bash
         run: |
           sudo apt-get update
 
           sudo apt-get install -y --no-install-recommends \
-            bc \
-            bison \
-            flex \
-            libssl-dev \
-            libelf-dev \
-            libncurses-dev \
-            cpio \
-            kmod \
-            zip \
-            unzip \
-            python3 \
-            gcc-aarch64-linux-gnu \
-            binutils \
-            file \
-            rsync \
-            lz4 \
-            zstd \
-            device-tree-compiler
+            bc bison flex libssl-dev libelf-dev libncurses-dev \
+            cpio kmod zip unzip python3 gcc-aarch64-linux-gnu \
+            binutils file rsync lz4 zstd device-tree-compiler
 
       - name: Set up AOSP clang
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -88,7 +74,6 @@ jobs:
             "$HOME/clang"
 
           rm -rf "$HOME/clang/.git"
-
           echo "$HOME/clang/bin" >> "$GITHUB_PATH"
 
       - name: Set build variables
@@ -99,7 +84,6 @@ jobs:
           LV="${{ inputs.localversion || '-moto-kcp1' }}"
 
           echo "LV=$LV" >> "$GITHUB_ENV"
-
           echo "MAKE_ARGS=O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu-" >> "$GITHUB_ENV"
 
       - name: Configure kernel
@@ -108,7 +92,6 @@ jobs:
           set -euo pipefail
 
           clang --version | head -1
-
           touch .scmversion
 
           make $MAKE_ARGS "$DEFCONFIG"
@@ -123,18 +106,27 @@ jobs:
           scripts/config --file out/.config \
             --enable BUILD_ARM64_DT_OVERLAY
 
+          # Moto G84 device tree
+          scripts/config --file out/.config \
+            --enable BANGKK_DTB
+
           make $MAKE_ARGS olddefconfig
           make $MAKE_ARGS syncconfig
 
-          # LLVM verification
+          # Verify LLVM
           grep -q '^CONFIG_CC_IS_CLANG=y' out/.config
           grep -q '^CONFIG_LD_IS_LLD=y' out/.config
 
-          # DT overlay verification
-          if ! grep -q '^CONFIG_BUILD_ARM64_DT_OVERLAY=y' out/.config; then
-            echo "::error::CONFIG_BUILD_ARM64_DT_OVERLAY is not enabled"
+          # Verify DT configuration
+          grep -q '^CONFIG_BUILD_ARM64_DT_OVERLAY=y' out/.config || {
+            echo "::error::BUILD_ARM64_DT_OVERLAY is not enabled"
             exit 1
-          fi
+          }
+
+          grep -q '^CONFIG_BANGKK_DTB=y' out/.config || {
+            echo "::error::BANGKK_DTB is not enabled"
+            exit 1
+          }
 
           echo "Kernel configuration validated successfully!"
 
@@ -164,6 +156,31 @@ jobs:
           make -j"$(nproc)" $MAKE_ARGS \
             Image dtbs modules 2>&1 | tee build.log
 
+      - name: Diagnose generated device trees
+        if: always()
+        shell: bash
+        run: |
+          echo "===== DT CONFIG ====="
+          grep -E '^CONFIG_(MMI_DEVICE_DTBS|ARCH_BLAIR|BANGKK_DTB|BUILD_ARM64_DT_OVERLAY)=' out/.config || true
+
+          echo ""
+          echo "===== GENERATED DTB FILES ====="
+          find out/arch/arm64/boot/dts \
+            -type f -name '*.dtb' -print 2>/dev/null | sort || true
+
+          echo ""
+          echo "===== GENERATED DTBO FILES ====="
+          find out/arch/arm64/boot/dts \
+            -type f -name '*.dtbo' -print 2>/dev/null | sort || true
+
+          echo ""
+          echo "===== EXPECTED MOTO G84 FILES ====="
+          find out/arch/arm64/boot/dts \
+            -type f \( \
+              -name 'blair-moto-bangkk-base.dtb' \
+              -o -name 'blair-bangkk-evb1-overlay.dtbo' \
+            \) -print 2>/dev/null || true
+
       - name: Install modules
         shell: bash
         run: |
@@ -171,7 +188,6 @@ jobs:
 
           rm -rf modules_out
 
-          # Do not strip modules before checking their metadata.
           make $MAKE_ARGS \
             INSTALL_MOD_PATH="$PWD/modules_out" \
             modules_install
@@ -200,7 +216,6 @@ jobs:
           while IFS= read -r -d '' KO; do
             TOTAL=$((TOTAL + 1))
 
-            # Read vermagic directly from the ELF .modinfo section.
             VM="$(
               readelf -p .modinfo "$KO" 2>/dev/null |
               sed -n 's/.*vermagic=//p' |
@@ -221,13 +236,8 @@ jobs:
 
           echo "modules: $TOTAL, wrong: $BAD (expected: $EXPECT ...)"
 
-          if [ "$TOTAL" -eq 0 ]; then
-            echo "::error::No modules found"
-            exit 1
-          fi
-
-          if [ "$BAD" -ne 0 ]; then
-            echo "::error::$BAD modules have incorrect vermagic"
+          if [ "$TOTAL" -eq 0 ] || [ "$BAD" -ne 0 ]; then
+            echo "::error::Module vermagic validation failed"
             exit 1
           fi
 
@@ -242,8 +252,6 @@ jobs:
           if [ -d modules_out/lib ]; then
             tar -C modules_out \
               -czf "modules-${KREL}.tar.gz" lib
-
-            echo "Modules archived successfully"
           else
             echo "::warning::modules_out/lib does not exist"
           fi
@@ -266,6 +274,8 @@ jobs:
             build.log
             out/.config
             out/include/config/kernel.release
+            out/arch/arm64/boot/dts/**/*.dtb
+            out/arch/arm64/boot/dts/**/*.dtbo
           if-no-files-found: ignore
           retention-days: 7
 
@@ -274,7 +284,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Verify kernel image
           IMAGE="out/arch/arm64/boot/Image"
 
           if [ ! -s "$IMAGE" ]; then
@@ -282,34 +291,30 @@ jobs:
             exit 1
           fi
 
+          # Require the expected Moto G84 base DTB.
+          DTB="$(find out/arch/arm64/boot/dts \
+            -type f -name 'blair-moto-bangkk-base.dtb' \
+            -print -quit)"
+
+          if [ -z "$DTB" ]; then
+            echo "::error::Moto G84 base DTB was not generated"
+            exit 1
+          fi
+
+          echo "Using DTB: $DTB"
+
           git clone --depth 1 \
             -b "$ANYKERNEL_BRANCH" \
             "$ANYKERNEL_REPO" ak3
 
           cp "$IMAGE" ak3/Image
 
-          # Collect DTBs
-          DTB_DIR="out/arch/arm64/boot/dts/vendor/qcom"
+          # Preserve the base DTB separately for inspection.
+          cp "$DTB" ak3/
 
-          if [ ! -d "$DTB_DIR" ]; then
-            echo "::error::DTB directory not found"
-            exit 1
-          fi
+          # Do not concatenate every DTB or DTBO blindly.
+          # AnyKernel3 installation format must be confirmed first.
 
-          mapfile -t DTBS < <(
-            find "$DTB_DIR" -type f -name '*.dtb' | sort
-          )
-
-          if [ "${#DTBS[@]}" -eq 0 ]; then
-            echo "::error::No DTBs found"
-            exit 1
-          fi
-
-          cat "${DTBS[@]}" > ak3/dtb
-
-          echo "DTBs packaged: ${#DTBS[@]}"
-
-          # Install modules
           cd ak3
 
           if [ ! -f place-modules.sh ]; then
@@ -332,8 +337,6 @@ jobs:
             '*placeholder'
 
           echo "ZIP=$ZIP" >> "$GITHUB_ENV"
-
-          echo "Package created: $ZIP"
 
       - name: Upload flashable zip
         uses: actions/upload-artifact@v4
