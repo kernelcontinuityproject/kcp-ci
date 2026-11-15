@@ -110,6 +110,27 @@ jobs:
           make $MAKE_ARGS INSTALL_MOD_PATH="$PWD/modules_out" INSTALL_MOD_STRIP=1 modules_install
           find modules_out -name '*.ko' | wc -l
 
+
+      - name: Diagnose module vermagic
+        run: |
+          echo "Expected vermagic:"
+          cat out/include/config/kernel.release
+
+          for f in \
+            modules_out/lib/modules/*/kernel/lib/lzo/lzo_decompress.ko \
+            modules_out/lib/modules/*/kernel/lib/lzo/lzo_compress.ko \
+            modules_out/lib/modules/*/kernel/crypto/lzo.ko \
+            modules_out/lib/modules/*/kernel/crypto/lzo-rle.ko
+          do
+            echo ""
+            echo "===== $f ====="
+            ls -l "$f"
+            file "$f"
+            modinfo -F vermagic "$f" || true
+            readelf -S "$f" | grep -E 'modinfo|this_module'
+            readelf -p .modinfo "$f" || true
+          done
+          
       - name: Verify module vermagic
         run: |
           EXPECT="$(cat out/include/config/kernel.release)"
