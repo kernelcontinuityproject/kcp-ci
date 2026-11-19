@@ -1,0 +1,367 @@
+name: Build KCP kernel for motorola rhode
+
+on:
+  workflow_dispatch:
+    inputs:
+      localversion:
+        description: "Kernel release suffix (appended to 4.19.x)"
+        default: "-moto-cip136-kcp_android17"
+        type: string
+      kernel_ref:
+        description: "Kernel branch/tag/commit to build"
+        default: "lineage-24.0"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  ARCH: arm64
+
+  KERNEL_REPO: kernelcontinuityproject/android_kernel_motorola_sm6225-kcp-android17
+
+  # rhode = khaje (SM6225). Config fragments turn on MMI_DEVICE_DTBS and RHODE_DTB.
+  DEFCONFIG: vendor/bengal-lite-perf_defconfig
+  DEFCONFIG_FRAGMENTS: >-
+    vendor/ext_config/moto-bengal.config
+    vendor/ext_config/rhode-default.config
+
+  ANYKERNEL_REPO: https://gitlab.com/MatrixhKa/AnyKernel3.git
+  # leave empty to use the repository's default branch
+  ANYKERNEL_BRANCH: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.KERNEL_REPO }}
+          ref: ${{ inputs.kernel_ref || 'lineage-24.0' }}
+          fetch-depth: 1
+
+      - name: Check kernel tree
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f Makefile ] \
+            || ! grep -q '^VERSION = 4' Makefile \
+            || ! grep -q '^PATCHLEVEL = 19' Makefile; then
+            echo "::error::This is not a 4.19 kernel tree"
+            ls -la
+            exit 1
+          fi
+
+          test -f "arch/arm64/configs/$DEFCONFIG"
+
+          for f in $DEFCONFIG_FRAGMENTS; do
+            test -f "arch/arm64/configs/$f"
+          done
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev libncurses-dev \
+            cpio kmod zip unzip python3 gcc-aarch64-linux-gnu \
+            binutils file rsync lz4 zstd device-tree-compiler \
+            clang-18 lld-18 llvm-18
+
+      - name: Set up clang
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # This tree adds warning flags that need clang >= 16
+          # (e.g. -Wno-cast-function-type-strict), so the old AOSP
+          # clang-r416183b cannot build it. Default: LLVM 18 from Ubuntu.
+          # To use another clang (for example an AOSP one), set the
+          # CLANG_URL repository variable to a tar.gz with bin/clang.
+          if [ -n "${{ vars.CLANG_URL }}" ]; then
+            mkdir -p "$HOME/clang"
+            curl -fsSL "${{ vars.CLANG_URL }}" | tar -xz -C "$HOME/clang"
+            echo "$HOME/clang/bin" >> "$GITHUB_PATH"
+          else
+            echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Set build variables
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          LV="${{ inputs.localversion || '-moto-cip136-kcp_android17' }}"
+
+          echo "LV=$LV" >> "$GITHUB_ENV"
+          echo "MAKE_ARGS=O=out ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu-" >> "$GITHUB_ENV"
+
+      - name: Configure kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          clang --version | head -1
+          ld.lld --version | head -1
+
+          # The release string comes from localversion-* files plus
+          # CONFIG_LOCALVERSION. The tree ships localversion-cip (-cip136)
+          # and localversion-st (-st20); replace them so the final release
+          # is exactly <kernelversion><LV>. Only this CI checkout is touched.
+          printf '%s\n' "$LV" > localversion-cip
+          rm -f localversion-st
+          touch .scmversion
+
+          make $MAKE_ARGS "$DEFCONFIG"
+
+          FRAGS=""
+          for f in $DEFCONFIG_FRAGMENTS; do
+            FRAGS="$FRAGS arch/arm64/configs/$f"
+          done
+
+          scripts/kconfig/merge_config.sh -m -O out out/.config $FRAGS
+
+          scripts/config --file out/.config \
+            --set-str LOCALVERSION "" \
+            --disable LOCALVERSION_AUTO \
+            --enable BUILD_ARM64_DT_OVERLAY
+
+          make $MAKE_ARGS olddefconfig
+          make $MAKE_ARGS syncconfig
+
+          # Verify LLVM
+          grep -q '^CONFIG_CC_IS_CLANG=y' out/.config
+          grep -q '^CONFIG_LD_IS_LLD=y' out/.config
+
+          # Verify the rhode device tree configuration
+          for sym in ARCH_KHAJE MMI_DEVICE_DTBS RHODE_DTB BUILD_ARM64_DT_OVERLAY; do
+            grep -q "^CONFIG_${sym}=y" out/.config || {
+              echo "::error::CONFIG_${sym} is not enabled"
+              exit 1
+            }
+          done
+
+          echo "Kernel configuration validated successfully!"
+
+      - name: Check kernel release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE="$(make -s kernelversion)"
+          KREL="$(make -s $MAKE_ARGS kernelrelease)"
+
+          echo "kernelversion=$BASE"
+          echo "kernelrelease=$KREL"
+
+          if [ "$KREL" != "${BASE}${LV}" ]; then
+            echo "::error::Unexpected kernel release: $KREL (expected ${BASE}${LV})"
+            exit 1
+          fi
+
+          echo "KREL=$KREL" >> "$GITHUB_ENV"
+
+      - name: Build kernel, DTBs and modules
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          make -j"$(nproc)" $MAKE_ARGS \
+            Image dtbs modules 2>&1 | tee build.log
+
+      - name: Show build errors
+        if: failure()
+        shell: bash
+        run: |
+          # Put the first errors in the run annotations
+          grep -E 'error:|\*\*\*' build.log 2>/dev/null | head -n 10 | while IFS= read -r l; do
+            echo "::error::${l}"
+          done || true
+
+      - name: Diagnose generated device trees
+        if: always()
+        shell: bash
+        run: |
+          echo "===== DT CONFIG ====="
+          grep -E '^CONFIG_(MMI_DEVICE_DTBS|ARCH_KHAJE|RHODE_DTB|BUILD_ARM64_DT_OVERLAY)=' out/.config || true
+
+          echo ""
+          echo "===== EXPECTED RHODE FILES ====="
+          find out/arch/arm64/boot/dts -type f \( \
+            -name 'khaje-moto-base.dtb' \
+            -o -name 'khaje-rhode-*-overlay.dtbo' \
+          \) -print 2>/dev/null | sort || true
+
+      - name: Install modules
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf modules_out
+
+          make $MAKE_ARGS \
+            INSTALL_MOD_PATH="$PWD/modules_out" \
+            modules_install
+
+          MODULE_COUNT="$(find modules_out -type f -name '*.ko' | wc -l)"
+          echo "Installed modules: $MODULE_COUNT"
+
+          if [ "$MODULE_COUNT" -eq 0 ]; then
+            echo "::warning::No in-tree kernel modules were installed"
+          fi
+
+          echo "MODULE_COUNT=$MODULE_COUNT" >> "$GITHUB_ENV"
+
+      - name: Verify module vermagic
+        if: env.MODULE_COUNT != '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXPECT="$(cat out/include/config/kernel.release)"
+
+          BAD=0
+          TOTAL=0
+
+          echo "Expected vermagic: $EXPECT"
+
+          while IFS= read -r -d '' KO; do
+            TOTAL=$((TOTAL + 1))
+
+            VM="$(
+              readelf -p .modinfo "$KO" 2>/dev/null |
+              sed -n 's/.*vermagic=//p' |
+              head -n 1 |
+              sed 's/[[:space:]]*$//'
+            )"
+
+            case "$VM" in
+              "$EXPECT" | "$EXPECT "*)
+                ;;
+              *)
+                echo "wrong vermagic: $KO -> $VM"
+                BAD=$((BAD + 1))
+                ;;
+            esac
+
+          done < <(find modules_out -type f -name '*.ko' -print0)
+
+          echo "modules: $TOTAL, wrong: $BAD (expected: $EXPECT ...)"
+
+          if [ "$TOTAL" -eq 0 ] || [ "$BAD" -ne 0 ]; then
+            echo "::error::Module vermagic validation failed"
+            exit 1
+          fi
+
+          echo "All modules have valid vermagic!"
+
+      - name: Archive modules
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -d modules_out/lib ]; then
+            tar -C modules_out \
+              -czf "modules-${KREL}.tar.gz" lib
+          else
+            echo "::warning::modules_out/lib does not exist"
+          fi
+
+      - name: Upload modules
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kcp-modules-${{ env.KREL }}
+          path: modules-${{ env.KREL }}.tar.gz
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kcp-build-diagnostics
+          path: |
+            build.log
+            out/.config
+            out/include/config/kernel.release
+            out/arch/arm64/boot/dts/**/*.dtb
+            out/arch/arm64/boot/dts/**/*.dtbo
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Package with AnyKernel3
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE="out/arch/arm64/boot/Image"
+
+          if [ ! -s "$IMAGE" ]; then
+            echo "::error::Kernel Image not found"
+            exit 1
+          fi
+
+          DTB="$(find out/arch/arm64/boot/dts \
+            -type f -name 'khaje-moto-base.dtb' \
+            -print -quit)"
+
+          if [ -z "$DTB" ]; then
+            echo "::error::khaje-moto-base.dtb was not generated"
+            exit 1
+          fi
+
+          echo "Using DTB: $DTB"
+
+          if [ -n "$ANYKERNEL_BRANCH" ]; then
+            git clone --depth 1 -b "$ANYKERNEL_BRANCH" "$ANYKERNEL_REPO" ak3
+          else
+            git clone --depth 1 "$ANYKERNEL_REPO" ak3
+          fi
+
+          cp "$IMAGE" ak3/Image
+          cp "$DTB" ak3/dtb
+
+          # Rhode overlays, kept in a folder for the AnyKernel3 script to use
+          mkdir -p ak3/dtbo
+          find out/arch/arm64/boot/dts -type f -name 'khaje-rhode-*-overlay.dtbo' \
+            -exec cp {} ak3/dtbo/ \;
+
+          if [ "${MODULE_COUNT:-0}" -gt 0 ]; then
+            if [ -f ak3/place-modules.sh ]; then
+              chmod +x ak3/place-modules.sh
+              (cd ak3 && ./place-modules.sh \
+                "../modules_out/lib/modules/$KREL" \
+                modules/vendor/lib/modules \
+                /vendor/lib/modules)
+            else
+              mkdir -p ak3/modules/vendor/lib/modules
+              find "modules_out/lib/modules/$KREL" -name '*.ko' \
+                -exec cp {} ak3/modules/vendor/lib/modules/ \;
+            fi
+          fi
+
+          cd ak3
+
+          ZIP="KCP-${KREL}-$(date +%Y%m%d).zip"
+
+          zip -r9 "../$ZIP" . \
+            -x '.git*' \
+            'README.md' \
+            '*placeholder'
+
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+
+      - name: Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: kcp-${{ env.KREL }}
+          path: ${{ env.ZIP }}
+          if-no-files-found: error
+          retention-days: 14
